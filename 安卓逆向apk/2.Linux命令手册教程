@@ -1,0 +1,300 @@
+Linux命令手册教程
+
+#verxion 1.2
+
+
+
+# APK 会员/订单恢复逻辑安全分析
+
+## 1. 核心流程
+
+```text
+用户输入订单号
+    ↓
+showOrderCheckDialog()
+    ↓
+checkOrderStatusWithServer(orderNumber)
+    ↓
+服务器返回订单状态
+    ↓
+Boolean.parseBoolean(body.string())
+    ↓
+boolean z
+    ↓
+invoke(boolean z)
+    ├─ z == true
+    │   ├─ markOrderNumberAsUsed()
+    │   ├─ AccessManager.grantPermanentUnlock(...)
+    │   ├─ 提示恢复成功
+    │   └─ 返回上一页面
+    │
+    └─ z == false
+        └─ 提示订单不存在/需要购买
+```
+
+## 2. 服务器结果到授权分支
+
+反编译代码中有：
+
+```java
+boolean parseBoolean = Boolean.parseBoolean(body.string());
+```
+
+对应 Smali 的核心结构：
+
+```smali
+invoke-virtual {p1}, L.../ResponseBody;->string()Ljava/lang/String;
+move-result-object p1
+
+invoke-static {p1}, Ljava/lang/Boolean;->parseBoolean(Ljava/lang/String;)Z
+move-result p1
+```
+
+随后这个 boolean 被传给：
+
+```java
+invoke(boolean z)
+```
+
+因此数据流是：
+
+```text
+HTTP Response Body
+      ↓
+String
+      ↓
+Boolean.parseBoolean()
+      ↓
+boolean z
+      ↓
+invoke(z)
+```
+
+## 3. `if (z)` 对应的 Smali
+
+Java：
+
+```java
+public void invoke(boolean z) {
+    if (z) {
+        // 成功分支
+    } else {
+        // 失败分支
+    }
+}
+```
+
+对应的控制流类似：
+
+```smali
+.method public final invoke(Z)V
+
+    ...
+
+    if-eqz p1, :cond_37
+
+    # z == true
+    ...
+
+    :cond_37
+    # z == false
+    ...
+
+.end method
+```
+
+这里 `Z` 表示 Java `boolean`，通常：
+
+```text
+0 = false
+1 = true
+```
+
+`if-eqz p1, :cond_37` 表示：
+
+```text
+p1 == 0 → 跳到 :cond_37
+p1 != 0 → 继续执行下面的代码
+```
+
+## 4. 实际授权位置
+
+成功分支中最关键的调用是：
+
+```java
+AccessManager.INSTANCE.grantPermanentUnlock(
+    context,
+    UnlockSource.RESTORE
+);
+```
+
+从调用位置看，它负责把“恢复购买成功”转换成本地永久解锁状态。
+
+因此授权链可以概括为：
+
+```text
+订单号
+  ↓
+服务器检查
+  ↓
+HTTP response
+  ↓
+Boolean.parseBoolean()
+  ↓
+boolean z
+  ↓
+if (z)
+  ↓
+grantPermanentUnlock()
+  ↓
+本地会员解锁
+```
+
+## 5. 本地订单号记录
+
+代码还存在：
+
+```java
+markOrderNumberAsUsed(orderNumber);
+```
+
+以及类似：
+
+```java
+private final boolean isOrderNumberExpired(String str) {
+    return requireContext()
+        .getSharedPreferences("UsedOrderNumbers", 0)
+        .getBoolean(str, false);
+}
+
+private final void markOrderNumberAsUsed(String str) {
+    requireContext()
+        .getSharedPreferences("UsedOrderNumbers", 0)
+        .edit()
+        .putBoolean(str, true)
+        .apply();
+}
+```
+
+因此 `UsedOrderNumbers` 主要用于记录已经恢复过的订单号，防止同一个订单号被重复使用。
+
+它与真正的支付真实性验证是两个不同层次。
+
+## 6. 安全风险
+
+从 APK 安全审计角度，当前结构最值得关注的是：
+
+```text
+服务器结果
+   ↓
+boolean z
+   ↓
+本地 if(z)
+   ↓
+grantPermanentUnlock()
+```
+
+如果客户端可以被篡改，使授权分支的输入或控制流发生变化，那么本地永久授权函数可能被错误触发。
+
+因此这里体现出一个典型的**客户端信任边界风险**：
+
+> 客户端最终拥有调用本地永久解锁逻辑的能力。
+
+如果 `grantPermanentUnlock()` 只是把会员状态写入 SharedPreferences、数据库或其他本地存储，那么还需要继续审计这些状态的保存和读取方式。
+
+## 7. 下一步建议审计的位置
+
+### A. `AccessManager.grantPermanentUnlock()`
+
+重点确认它究竟修改了什么：
+
+- SharedPreferences
+- SQLite/数据库
+- 文件
+- 加密状态
+- Token
+- 签名授权凭证
+
+### B. 会员状态读取逻辑
+
+搜索：
+
+```text
+isUnlocked
+isPremium
+isMember
+hasAccess
+premium
+unlocked
+```
+
+确认应用实际使用哪个状态判断会员功能。
+
+### C. `requestOrderInfo()` 的完整网络回调
+
+确认服务器返回的数据格式，以及客户端是否只信任一个简单的 `true/false`。
+
+### D. 授权凭证
+
+检查是否存在：
+
+```text
+数字签名
+订单绑定
+设备绑定
+有效期
+nonce
+服务器 Token
+```
+
+## 8. 更安全的实现方式
+
+如果这是开发者自己的 APK，更安全的授权模型应当是：
+
+```text
+客户端提交订单
+      ↓
+服务器验证真实支付状态
+      ↓
+服务器生成签名授权凭证
+      ↓
+客户端验证签名
+      ↓
+验证订单/用户/设备/有效期
+      ↓
+保存授权状态
+```
+
+对于高价值会员权限，还可以让服务器在关键操作时再次验证授权，而不是完全依赖本地 boolean。
+
+## 9. 结论
+
+当前代码的主要会员恢复链为：
+
+```text
+订单号
+  ↓
+checkOrderStatusWithServer()
+  ↓
+服务器 HTTP 响应
+  ↓
+Boolean.parseBoolean()
+  ↓
+boolean z
+  ↓
+PayFragment$showOrderCheckDialog$1$1.invoke(z)
+  ↓
+if (z)
+  ↓
+AccessManager.grantPermanentUnlock()
+  ↓
+本地永久解锁
+```
+
+最值得审计的三个位置：
+
+1. `Boolean.parseBoolean(body.string())` —— 服务器结果转换。
+2. `if-eqz p1, :cond_37` —— 成功/失败控制流分界。
+3. `grantPermanentUnlock(..., UnlockSource.RESTORE)` —— 实际本地授权操作。
+
+本报告适合用于授权 APK 的逆向学习和安全审计；修复时应重点保护服务器授权与客户端本地状态之间的信任边界。
