@@ -1,0 +1,372 @@
+Linux命令手册教程
+#version 1.0
+
+# APK 付费逻辑安全测试报告
+
+## 1. 测试概述
+
+**测试对象：** Android APK  
+**测试模块：** `PayFragment` / `SharePayed`  
+**测试类型：** 客户端支付状态校验与会员逻辑测试  
+**测试目的：** 验证客户端是否过度信任服务端返回的支付状态，以及该状态是否能够被本地篡改。
+
+> 注：本文档用于授权安全测试和漏洞汇报，不包含可直接用于第三方应用付费绕过的完整补丁或重新打包步骤。
+
+---
+
+## 2. 会员功能
+
+从会员页面可以观察到，购买会员后主要提供以下功能：
+
+- 永久去除 APP 内广告
+- 访问 Linux 命令手册
+- 解锁教程内容
+- 支持通过订单号恢复购买
+
+页面存在支付宝订单号恢复入口，并提示用户输入支付宝支付订单号。
+
+---
+
+## 3. 关键类分析
+
+### 3.1 `SharePayed`
+
+`SharePayed` 类负责使用 `SharedPreferences` 保存和读取本地数据。
+
+核心结构：
+
+```java
+private static SharedPreferences sps;
+
+private final SharedPreferences getSps(Context context) {
+    if (sps == null) {
+        sps = context.getSharedPreferences("default", 0);
+    }
+    return sps;
+}
+```
+
+同时提供类似：
+
+```java
+putString(...)
+getString(...)
+```
+
+的方法。
+
+这说明 APP 存在本地持久化状态。
+
+需要注意：仅发现 `SharedPreferences` 并不能单独证明会员状态可以被直接伪造，还需要继续确认具体 Key 及其使用位置。
+
+---
+
+## 4. `PayFragment` 支付流程
+
+`PayFragment` 中存在订单号、订单状态查询以及恢复购买相关逻辑。
+
+主要流程可以概括为：
+
+```text
+用户输入订单号
+        ↓
+检查订单号是否已经使用
+        ↓
+请求服务器检查订单状态
+        ↓
+GET check_order.php?out_trade_no=订单号
+        ↓
+服务器返回结果
+        ↓
+客户端解析 true / false
+        ↓
+Callback
+        ↓
+PayFragment 后续会员逻辑
+```
+
+代码中可以看到类似：
+
+```java
+StringBuilder stringBuilder =
+    new StringBuilder(
+        "http://www.seventechnology.cn/check_order.php?out_trade_no="
+    );
+
+stringBuilder.append(str);
+```
+
+随后通过 OkHttp 发起 GET 请求。
+
+---
+
+## 5. 服务端返回值处理
+
+在：
+
+`PayFragment$checkOrderStatusWithServer$2`
+
+的 `onResponse()` 中发现关键逻辑：
+
+```java
+ResponseBody body = response.body();
+
+boolean parseBoolean =
+    Boolean.parseBoolean(body.string());
+```
+
+反编译后的 Smali 对应核心结构：
+
+```smali
+invoke-virtual {p2}, Lokhttp3/Response;->body()Lokhttp3/ResponseBody;
+invoke-virtual {p1}, Lokhttp3/ResponseBody;->string()Ljava/lang/String;
+invoke-static {p1}, Ljava/lang/Boolean;->parseBoolean(Ljava/lang/String;)Z
+move-result p1
+```
+
+这里服务器响应内容被直接转换成 Boolean。
+
+其行为大致为：
+
+```text
+"true"  → true
+"false" → false
+其他值  → false
+```
+
+随后该 Boolean 被传递给 Callback。
+
+---
+
+## 6. Callback 分析
+
+`PayFragment$checkOrderStatusWithServer$2` 中存在：
+
+```java
+public void onResponse(Call call, Response response) {
+    ...
+    boolean parseBoolean =
+        Boolean.parseBoolean(body.string());
+
+    ...
+
+    callback.invoke(Boolean.valueOf(parseBoolean));
+}
+```
+
+另一个 Lambda 中可以看到：
+
+```java
+function1.invoke(Boolean.valueOf(z));
+```
+
+因此调用链可以明确表示为：
+
+```text
+HTTP Response
+     ↓
+ResponseBody.string()
+     ↓
+Boolean.parseBoolean()
+     ↓
+boolean
+     ↓
+Function1<Boolean, Unit>
+     ↓
+PayFragment
+     ↓
+后续订单/会员处理
+```
+
+---
+
+## 7. 动态验证结果
+
+在授权测试环境中对客户端的 Boolean 结果进行修改后进行验证。
+
+测试结果：
+
+```text
+原始服务器状态
+    ↓
+客户端解析 Boolean
+    ↓
+正常进入对应 Callback
+
+篡改客户端 Boolean 结果
+    ↓
+Callback 接收到成功状态
+    ↓
+会员功能被解锁
+```
+
+因此可以确认：
+
+**客户端的支付状态判断对后续会员逻辑具有直接影响，并且客户端侧的这一判断可以被篡改。**
+
+这证明该应用存在明显的客户端支付状态信任问题。
+
+---
+
+## 8. 漏洞影响
+
+如果攻击者能够修改 APK 或运行时篡改该 Boolean，且服务端没有在最终授权环节重新确认用户的真实购买状态，则可能导致：
+
+- 未付款用户获得会员功能
+- 付费校验被客户端逻辑绕过
+- 会员权限与真实订单状态不一致
+- 修改后的 APK 可以被重新分发
+
+漏洞的实际严重程度还需要结合服务端是否存在二次校验来最终确定。
+
+---
+
+## 9. 根本原因
+
+核心问题是：
+
+> **客户端参与决定“用户是否已经付费”，而不是由服务端最终决定会员权益。**
+
+当前流程类似：
+
+```text
+服务器 → 返回 true/false
+              ↓
+        客户端解释结果
+              ↓
+        客户端决定权限
+```
+
+这种设计使客户端成为可信执行环境，但 APK 本身属于攻击者可以控制的环境。
+
+---
+
+## 10. 修复建议
+
+### 10.1 服务端决定会员状态
+
+推荐：
+
+```text
+客户端提交用户身份 + 订单信息
+            ↓
+服务器验证订单
+            ↓
+服务器确认商品、金额、支付状态、用户绑定关系
+            ↓
+服务器更新账户会员状态
+            ↓
+客户端只读取服务器最终权限
+```
+
+不要让客户端通过修改一个 Boolean 就能够获得会员权限。
+
+### 10.2 服务端验证订单
+
+至少应验证：
+
+- 订单号是否真实存在
+- 订单是否属于当前用户
+- 商品是否正确
+- 支付金额是否正确
+- 支付状态是否成功
+- 订单是否已经使用
+- 是否存在重复使用/重放
+- 订单是否已经退款
+
+### 10.3 不要把会员状态仅保存在本地
+
+`SharedPreferences` 可以作为缓存，但不能作为最终授权依据。
+
+例如：
+
+```text
+SharedPreferences
+        ↓
+仅用于缓存
+        ↓
+真正权限仍由服务端确认
+```
+
+### 10.4 增加服务端授权接口
+
+客户端进入会员功能时，可以向服务器请求当前账户的会员状态。
+
+例如：
+
+```text
+GET /api/user/membership
+```
+
+服务器根据登录身份返回：
+
+```json
+{
+  "is_member": true,
+  "expire_at": "..."
+}
+```
+
+更重要的是服务器必须自行计算这个结果，而不是相信客户端上传的：
+
+```json
+{
+  "is_member": true
+}
+```
+
+---
+
+## 11. 安全测试结论
+
+本次测试确认了一个重要的安全设计问题：
+
+> **支付验证结果在客户端被解析为 Boolean，并直接进入后续 Callback / 会员处理链路；在客户端代码被篡改的情况下，该结果可以被人为控制，并导致会员功能状态发生变化。**
+
+因此建议开发方将**最终会员授权完全迁移到服务端**，客户端只负责展示服务器已经确认的权限。
+
+---
+
+## 12. 测试证据索引
+
+重点证据位置：
+
+| 位置 | 作用 |
+|---|---|
+| `PayFragment` | 支付/恢复购买入口 |
+| `checkOrderStatusWithServer()` | 查询订单状态 |
+| `check_order.php?out_trade_no=` | 服务端订单查询接口 |
+| `PayFragment$checkOrderStatusWithServer$2` | HTTP Response Callback |
+| `Boolean.parseBoolean()` | 将服务器响应转换为 Boolean |
+| `Function1<Boolean, Unit>` | 将结果传递回 PayFragment |
+| `SharePayed` | SharedPreferences 本地数据封装 |
+
+---
+
+## 13. 最终结论
+
+该 APK 的关键问题不是“某一行代码写错了”，而是**信任边界设计错误**：
+
+```text
+不可信的客户端
+      ↓
+自行解释支付结果
+      ↓
+自行决定会员权限
+```
+
+正确的安全模型应该是：
+
+```text
+客户端
+  ↓
+请求服务端
+  ↓
+服务端验证真实订单
+  ↓
+服务端确定会员状态
+  ↓
+客户端展示结果
+```
+
+这也是本次测试最值得向开发人员反馈的核心问题。
